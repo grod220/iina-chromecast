@@ -1,0 +1,26 @@
+{
+  "name": "IINA Chromecast",
+  "identifier": "dpacmittal.com.iina-chromecast",
+  "version": "1.0.0",
+  "description": "Chromecast support for IINA",
+  "author": {
+    "name": "Deepak Mittal",
+    "email": "deepak@geekdevs.com",
+    "url": "https://dpacmittal.com"
+  },
+  "entry": "dist/index.js",
+  "globalEntry": "dist/global.js",
+  "permissions": [
+    "show-osd",
+    "show-alert",
+    "video-overlay",
+    "network-request",
+    "file-system"
+  ],
+  "sidebarTab": {
+    "name": "IINA Chromecast"
+  },
+  "allowedDomains": ["*"],
+  "preferencesPage": "pref.html",
+  "preferenceDefaults": {}
+}

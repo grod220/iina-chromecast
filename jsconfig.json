@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "typeRoots": [
+      "./node_modules/@types",
+      "./node_modules/iina-plugin-definition"
+    ],
+    "jsx": "react",
+    "lib": [
+      "ES2017",
+      "DOM"
+    ]
+  }
+}
