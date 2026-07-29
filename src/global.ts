@@ -1,5 +1,7 @@
 const { utils, http, global, console: IINAConsole } = iina;
 const bin = `${utils.resolvePath("@data/casthelper")}`; // path inside the bundle
+
+IINAConsole.log("Casthelper path:", bin);
 const CONTROL = "http://127.0.0.1:9092";
 
 // messages arrive from each player's main entry

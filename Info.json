@@ -17,9 +17,6 @@
     "network-request",
     "file-system"
   ],
-  "sidebarTab": {
-    "name": "IINA Chromecast"
-  },
   "allowedDomains": ["*"],
   "preferencesPage": "pref.html",
   "preferenceDefaults": {}
