@@ -35,12 +35,14 @@ func appendField(b []byte, field int, s string) []byte {
 // encodeCastMessage serializes a castMessage to protobuf wire bytes.
 func encodeCastMessage(m castMessage) []byte {
 	var b []byte
-	b = append(b, 0x08, 0x00)             // field 1 protocol_version = 0 (varint)
-	b = appendField(b, 2, m.sourceID)     // field 2 source_id
-	b = appendField(b, 3, m.destID)       // field 3 destination_id
-	b = appendField(b, 4, m.namespace)    // field 4 namespace
-	b = append(b, 0x28, 0x00)             // field 5 payload_type = 0 STRING (varint)
-	b = appendField(b, 6, m.payloadUTF8)  // field 6 payload_utf8
+	b = append(b, 0x08, 0x00)            // field 1 protocol_version = 0 (varint)
+	b = appendField(b, 2, m.sourceID)    // field 2 source_id
+	b = appendField(b, 3, m.destID)      // field 3 destination_id
+	b = appendField(b, 4, m.namespace)   // field 4 namespace
+	b = append(b, 0x28, 0x00)            // field 5 payload_type = 0 STRING (varint)
+	b = appendField(b, 6, m.payloadUTF8) // field 6 payload_utf8
+	logTrace("encode: src=%s dest=%s ns=%s payloadLen=%d -> %d wire bytes",
+		m.sourceID, m.destID, shortNS(m.namespace), len(m.payloadUTF8), len(b))
 	return b
 }
 
@@ -52,22 +54,39 @@ func decodeCastMessage(b []byte) castMessage {
 	for i < len(b) {
 		tag, n := binary.Uvarint(b[i:])
 		if n <= 0 {
+			logWarn("decode: malformed tag varint at offset %d of %d (n=%d); stopping. bytes: %s",
+				i, len(b), n, hexdump(b, 128))
 			break
 		}
 		i += n
 		field := int(tag >> 3)
-		switch tag & 7 { // wire type
+		wire := tag & 7
+		switch wire {
 		case 0: // varint
-			_, n := binary.Uvarint(b[i:])
+			v, n := binary.Uvarint(b[i:])
+			if n <= 0 {
+				logWarn("decode: malformed varint for field %d at offset %d; stopping", field, i)
+				return m
+			}
+			logTrace("decode: field %d varint = %d", field, v)
 			i += n
 		case 5: // 32-bit
+			logTrace("decode: field %d fixed32, skipping", field)
 			i += 4
 		case 1: // 64-bit
+			logTrace("decode: field %d fixed64, skipping", field)
 			i += 8
 		case 2: // length-delimited
 			l, n := binary.Uvarint(b[i:])
+			if n <= 0 {
+				logWarn("decode: malformed length varint for field %d at offset %d; stopping", field, i)
+				return m
+			}
 			i += n
 			if i+int(l) > len(b) {
+				logError("decode: field %d claims %d bytes but only %d remain — truncated frame; "+
+					"decoded so far: src=%q dest=%q ns=%q payloadLen=%d",
+					field, l, len(b)-i, m.sourceID, m.destID, m.namespace, len(m.payloadUTF8))
 				return m
 			}
 			val := string(b[i : i+int(l)])
@@ -81,8 +100,13 @@ func decodeCastMessage(b []byte) castMessage {
 				m.namespace = val
 			case 6:
 				m.payloadUTF8 = val
+			case 7:
+				logWarn("decode: message carries a binary payload (%d bytes) instead of payload_utf8 — not handled", l)
+			default:
+				logTrace("decode: ignoring unknown length-delimited field %d (%d bytes)", field, l)
 			}
 		default:
+			logWarn("decode: unsupported wire type %d for field %d at offset %d; stopping", wire, field, i)
 			return m
 		}
 	}
