@@ -10,3 +10,5 @@ lipo -create -output casthelper casthelper-arm64 casthelper-amd64
 codesign -s - --options runtime casthelper
 chmod +x casthelper
 mv casthelper ../
+rm casthelper-arm64
+rm casthelper-amd64
