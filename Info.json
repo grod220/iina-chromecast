@@ -18,6 +18,6 @@
     "file-system"
   ],
   "allowedDomains": ["*"],
-  "preferencesPage": "pref.html",
-  "preferenceDefaults": {}
+  "ghRepo": "dpacmittal/iina-chromecast",
+  "ghVersion": "0.1.0"
 }
