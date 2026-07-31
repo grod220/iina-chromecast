@@ -1,11 +1,11 @@
 {
   "name": "IINA Chromecast",
-  "identifier": "dpacmittal.com.iina-chromecast",
-  "version": "1.0.0",
+  "identifier": "com.dpacmittal.iina-chromecast",
+  "version": "0.1.0",
   "description": "Chromecast support for IINA",
   "author": {
     "name": "Deepak Mittal",
-    "email": "deepak@geekdevs.com",
+    "email": "deepak@dpacmittal.com",
     "url": "https://dpacmittal.com"
   },
   "entry": "dist/index.js",
