@@ -1,4 +1,5 @@
-import { discoverChromecasts } from "./discover";
+import { discoverChromecasts, DiscoverResult } from "./discover";
+import { downloadCastHelper } from "./download-helper";
 
 const {
   standaloneWindow,
@@ -15,13 +16,49 @@ const {
 IINAConsole.log("Plugin is running");
 
 IINAEvent.on("iina.window-loaded", () => {
-  let mainMenuItem = menu.item("Chromecast", () => {});
-  menu.addItem(mainMenuItem);
-  mainMenuItem.addSubMenuItem(
-    menu.item("No devices found", () => {}, {
+  downloadCastHelper();
+});
+
+let noDevicesFoundMenuItem: IINA.MenuItem = null;
+let scanningMenuItem: IINA.MenuItem = null;
+
+function noDevicesFoundMenu() {
+  if (noDevicesFoundMenuItem) return noDevicesFoundMenuItem;
+  noDevicesFoundMenuItem = menu.item("Chromecast", () => {});
+  noDevicesFoundMenuItem.addSubMenuItem(
+    menu.item("No Devices Found", () => {}, {
       enabled: false,
     })
   );
+  return noDevicesFoundMenuItem;
+}
+
+function scanningMenu() {
+  if (scanningMenuItem) return scanningMenuItem;
+  scanningMenuItem = menu.item("Chromecast", () => {});
+  scanningMenuItem.addSubMenuItem(
+    menu.item("Scanning...", () => {}, {
+      enabled: false,
+    })
+  );
+  return scanningMenuItem;
+}
+
+function devicesMenu(devices: DiscoverResult[]) {
+  let devicesMenuItem = menu.item("Chromecast", () => {});
+  for (let i = 0; i < devices.length; i++) {
+    devicesMenuItem.addSubMenuItem(
+      menu.item(devices[i].name, () => {
+        castCurrent(devices[i].ip);
+      })
+    );
+  }
+  return devicesMenuItem;
+}
+
+IINAEvent.on("iina.window-loaded", () => {
+  menu.removeAllItems();
+  menu.addItem(scanningMenu());
   dynamicMenu();
   setInterval(dynamicMenu, 30000);
 });
@@ -34,16 +71,10 @@ async function dynamicMenu() {
   const devices = await discoverChromecasts();
   if (devices.length > 0) {
     menu.removeAllItems();
-    let mainMenuItem = menu.item("Chromecast", () => {});
-    mainMenuItem = menu.item("Chromecast", () => {});
-    menu.addItem(mainMenuItem);
-    for (let i = 0; i < devices.length; i++) {
-      mainMenuItem.addSubMenuItem(
-        menu.item(devices[i].name, () => {
-          castCurrent(devices[i].ip);
-        })
-      );
-    }
+    menu.addItem(devicesMenu(devices));
+  } else {
+    menu.removeAllItems();
+    menu.addItem(noDevicesFoundMenu());
   }
 }
 
