@@ -19,28 +19,53 @@ const (
 	nsReceiver   = "urn:x-cast:com.google.cast.receiver"
 	nsMedia      = "urn:x-cast:com.google.cast.media"
 
-	defaultReceiverAppID = "CC1AD845" // Default Media Receiver
-	senderID             = "sender-0"
-	platformReceiverID   = "receiver-0"
+	defaultReceiverAppID  = "CC1AD845" // Default Media Receiver
+	backdropReceiverAppID = "E8C28D3C" // Platform's idle Backdrop, observed on SWTV-20TW
+	senderID              = "sender-0"
+	platformReceiverID    = "receiver-0"
 )
 
 // castConn is a live connection to one Chromecast.
 type castConn struct {
-	conn io.ReadWriteCloser
-	addr string // remote address, for log context
+	conn     io.ReadWriteCloser
+	addr     string // remote address, for log context
+	senderID string // unique across overlapping reconnect/probe connections
 
-	writeMu sync.Mutex // serializes writes (heartbeat + control both write)
-	reqMu   sync.Mutex
-	reqID   int
+	writeOnce   sync.Once
+	writeGate   chan struct{} // deadline-aware serialization of heartbeat and control writes
+	lastInbound atomic.Int64
+	lastPong    atomic.Int64
+	reqMu       sync.Mutex
+	reqID       int
 
-	waitMu  sync.Mutex
-	waiters map[int]chan map[string]any
+	waitMu          sync.Mutex
+	waiters         map[int]chan map[string]any
+	waiterSource    map[int]string
+	waiterNamespace map[int]string
 
-	sessMu         sync.Mutex
-	transportID    string
-	mediaSessionID int
-	playerState    string // last playerState seen in a MEDIA_STATUS
-	idleReason     string // last idleReason seen in a MEDIA_STATUS
+	sessMu            sync.Mutex
+	transportID       string
+	mediaSessionID    int
+	playerState       string // last playerState seen in a MEDIA_STATUS
+	idleReason        string // last idleReason seen in a MEDIA_STATUS
+	currentTime       float64
+	duration          float64
+	positionUpdated   time.Time
+	playbackRate      float64
+	tracks            []map[string]any
+	activeTrackIDs    []int
+	textTrackStyle    map[string]any
+	volume            float64
+	muted             bool
+	receiverSession   string
+	sessionEnded      bool
+	expectedURL       string
+	ownsMedia         bool
+	takenOver         bool
+	loading           bool
+	loadRequestID     int
+	loadStarted       time.Time
+	supportedCommands *uint64
 
 	sent atomic.Uint64 // frames written
 	recv atomic.Uint64 // frames read
@@ -71,11 +96,14 @@ func dialCast(addr string) (*castConn, error) {
 	}
 
 	c := &castConn{
-		conn:    tlsConn,
-		addr:    addr,
-		waiters: make(map[int]chan map[string]any),
-		done:    make(chan struct{}),
+		conn:         tlsConn,
+		addr:         addr,
+		senderID:     newSenderID(),
+		waiters:      make(map[int]chan map[string]any),
+		done:         make(chan struct{}),
+		playbackRate: 1,
 	}
+	c.lastInbound.Store(time.Now().UnixNano())
 	go c.readLoop()
 
 	// Open the tp.connection virtual channel to the platform receiver.
@@ -98,28 +126,14 @@ func (c *castConn) nextReqID() int {
 }
 
 // send frames one CastMessage: 4-byte big-endian length prefix + protobuf bytes.
-func (c *castConn) send(m castMessage) error {
+func (c *castConn) send(m castMessage) error { return c.sendDeadline(m, time.Time{}) }
+func (c *castConn) sendDeadline(m castMessage, deadline time.Time) error {
 	payload := encodeCastMessage(m)
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
-
-	n := c.sent.Add(1)
-	logDebug("send #%d ns=%s dest=%s len=%d payload=%s", n, shortNS(m.namespace), m.destID, len(payload), truncate(m.payloadUTF8, 600))
-	if traceEnabled() {
-		logTrace("send #%d wire: %s", n, hexdump(payload, 256))
-	}
-
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	if _, err := c.conn.Write(hdr[:]); err != nil {
-		logError("send #%d: writing length prefix failed: %v", n, err)
-		return err
-	}
-	if _, err := c.conn.Write(payload); err != nil {
-		logError("send #%d: writing payload failed: %v", n, err)
-		return err
-	}
-	return nil
+	frame := make([]byte, 4+len(payload))
+	binary.BigEndian.PutUint32(frame, uint32(len(payload)))
+	copy(frame[4:], payload)
+	c.sent.Add(1)
+	return c.writeFrame(frame, deadline)
 }
 
 func (c *castConn) sendJSON(ns, dest string, payload map[string]any) error {
@@ -129,7 +143,7 @@ func (c *castConn) sendJSON(ns, dest string, payload map[string]any) error {
 		return err
 	}
 	return c.send(castMessage{
-		sourceID:    senderID,
+		sourceID:    c.sender(),
 		destID:      dest,
 		namespace:   ns,
 		payloadUTF8: string(b),
@@ -139,6 +153,9 @@ func (c *castConn) sendJSON(ns, dest string, payload map[string]any) error {
 // request sends a JSON message tagged with a requestId and waits for the reply
 // carrying the same requestId.
 func (c *castConn) request(ns, dest string, payload map[string]any) (map[string]any, error) {
+	return c.requestTimeout(ns, dest, payload, 10*time.Second)
+}
+func (c *castConn) requestTimeout(ns, dest string, payload map[string]any, timeout time.Duration) (map[string]any, error) {
 	id := c.nextReqID()
 	payload["requestId"] = id
 	kind, _ := payload["type"].(string)
@@ -146,27 +163,50 @@ func (c *castConn) request(ns, dest string, payload map[string]any) (map[string]
 	ch := make(chan map[string]any, 1)
 	c.waitMu.Lock()
 	c.waiters[id] = ch
+	if c.waiterSource == nil {
+		c.waiterSource = map[int]string{}
+		c.waiterNamespace = map[int]string{}
+	}
+	c.waiterSource[id] = dest
+	c.waiterNamespace[id] = ns
 	c.waitMu.Unlock()
 	defer func() {
 		c.waitMu.Lock()
 		delete(c.waiters, id)
+		delete(c.waiterSource, id)
+		delete(c.waiterNamespace, id)
 		c.waitMu.Unlock()
 	}()
 
 	logDebug("request: %s requestId=%d -> %s (ns=%s)", kind, id, dest, shortNS(ns))
 	start := time.Now()
-	if err := c.sendJSON(ns, dest, payload); err != nil {
+	deadline := start.Add(timeout)
+	if kind == "LOAD" {
+		c.sessMu.Lock()
+		c.loadRequestID = id
+		c.sessMu.Unlock()
+	}
+	body, marshalErr := json.Marshal(payload)
+	if marshalErr != nil {
+		return nil, marshalErr
+	}
+	if err := c.sendDeadline(castMessage{sourceID: c.sender(), destID: dest, namespace: ns, payloadUTF8: string(body)}, deadline); err != nil {
 		logError("request: %s requestId=%d could not be sent: %v", kind, id, err)
 		return nil, err
 	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
 	select {
 	case reply := <-ch:
 		rt, _ := reply["type"].(string)
 		logDebug("request: %s requestId=%d answered with %s in %s", kind, id, rt, time.Since(start).Round(time.Millisecond))
+		switch rt {
+		case "INVALID_REQUEST", "INVALID_PLAYER_STATE", "ERROR", "LOAD_FAILED", "LOAD_CANCELLED", "LAUNCH_ERROR":
+			return reply, &receiverRejection{Command: kind, Type: rt}
+		}
 		return reply, nil
-	case <-time.After(10 * time.Second):
-		logError("request: %s requestId=%d timed out after 10s with no reply from %s "+
-			"(device may have closed the virtual connection, or the namespace/destination is wrong)", kind, id, dest)
+	case <-timer.C:
+		logError("request: %s requestId=%d timed out after %s with no reply from %s", kind, id, timeout, dest)
 		return nil, errors.New("timed out waiting for device reply")
 	case <-c.done:
 		logError("request: %s requestId=%d aborted — connection closed", kind, id)
@@ -182,6 +222,7 @@ func (c *castConn) readLoop() {
 	logDebug("readLoop: started for %s", c.addr)
 	hdr := make([]byte, 4)
 	for {
+		c.readDeadline(receiveTimeout)
 		if _, err := io.ReadFull(c.conn, hdr); err != nil {
 			if errors.Is(err, io.EOF) {
 				logWarn("readLoop: device %s closed the connection", c.addr)
@@ -196,10 +237,12 @@ func (c *castConn) readLoop() {
 			return
 		}
 		buf := make([]byte, n)
+		c.readDeadline(5 * time.Second)
 		if _, err := io.ReadFull(c.conn, buf); err != nil {
 			logError("readLoop: reading %d-byte frame body failed: %v", n, err)
 			return
 		}
+		c.lastInbound.Store(time.Now().UnixNano())
 		seq := c.recv.Add(1)
 		if traceEnabled() {
 			logTrace("recv #%d wire (%d bytes): %s", seq, n, hexdump(buf, 256))
@@ -210,6 +253,9 @@ func (c *castConn) readLoop() {
 
 func (c *castConn) handle(seq uint64, m castMessage) {
 	logDebug("recv #%d ns=%s src=%s dest=%s payload=%s", seq, shortNS(m.namespace), m.sourceID, m.destID, truncate(m.payloadUTF8, 600))
+	if m.destID != "" && m.destID != "*" && m.destID != c.sender() {
+		return
+	}
 
 	if m.payloadUTF8 == "" {
 		logWarn("recv #%d: message has no UTF-8 payload (binary payload or decode failure) — ignoring", seq)
@@ -221,6 +267,11 @@ func (c *castConn) handle(seq uint64, m castMessage) {
 		return
 	}
 	msgType, _ := payload["type"].(string)
+	if _, ok := payload["requestId"]; !ok {
+		if id, ok := payload["launchRequestId"]; ok {
+			payload["requestId"] = id
+		}
+	}
 
 	// Answer heartbeat pings so the device keeps us alive.
 	if m.namespace == nsHeartbeat {
@@ -229,16 +280,46 @@ func (c *castConn) handle(seq uint64, m castMessage) {
 			if err := c.sendJSON(nsHeartbeat, platformReceiverID, map[string]any{"type": "PONG"}); err != nil {
 				logError("recv #%d: sending PONG failed: %v", seq, err)
 			}
-		} else {
-			logTrace("recv #%d: heartbeat %s", seq, msgType)
+		} else if msgType == "PONG" {
+			c.lastPong.Store(time.Now().UnixNano())
 		}
 		return
 	}
 
+	// Only the selected application transport may update our media state.
+	if m.namespace == nsMedia {
+		c.sessMu.Lock()
+		valid := c.transportID != "" && m.sourceID == c.transportID
+		c.sessMu.Unlock()
+		if !valid {
+			return
+		}
+	}
+	if m.namespace == nsReceiver && m.sourceID != platformReceiverID {
+		return
+	}
+	if id, ok := payload["requestId"].(float64); ok && id > 0 {
+		c.waitMu.Lock()
+		source, space := c.waiterSource[int(id)], c.waiterNamespace[int(id)]
+		c.waitMu.Unlock()
+		if source != "" && (source != m.sourceID || space != m.namespace) {
+			return
+		}
+	}
 	// The device closes a virtual connection when it drops us; without this the
 	// symptom is a silent stall.
 	if m.namespace == nsConnection && msgType == "CLOSE" {
+		c.sessMu.Lock()
+		ours := m.sourceID == c.transportID || m.sourceID == platformReceiverID
+		c.sessMu.Unlock()
 		logWarn("recv #%d: device closed the virtual connection from %s (reason: %v)", seq, m.sourceID, payload["reason"])
+		// CLOSE ends a control channel, not necessarily playback. Reconnect
+		// and inspect the receiver; only media/receiver status can establish
+		// completion or takeover. In particular, an idle receiver may retire
+		// immediately after accepting a new LOAD.
+		if ours {
+			c.Close()
+		}
 		return
 	}
 
@@ -283,7 +364,13 @@ func (c *castConn) logMediaStatus(seq uint64, payload map[string]any) {
 	if !ok || len(arr) == 0 {
 		// An empty status array is what the receiver sends when nothing is
 		// loaded — i.e. the media session went away.
-		logWarn("recv #%d: MEDIA_STATUS with empty status array — no media session on the device", seq)
+		c.sessMu.Lock()
+		if c.ownsMedia && !c.loading {
+			c.sessionEnded = true
+			c.ownsMedia = false
+			c.playerState = "IDLE"
+		}
+		c.sessMu.Unlock()
 		return
 	}
 	for _, s := range arr {
@@ -296,10 +383,85 @@ func (c *castConn) logMediaStatus(seq uint64, payload map[string]any) {
 		cur, _ := s0["currentTime"].(float64)
 
 		c.sessMu.Lock()
-		if id, ok := s0["mediaSessionId"].(float64); ok {
-			c.mediaSessionID = int(id)
+		id, _ := s0["mediaSessionId"].(float64)
+		media, _ := s0["media"].(map[string]any)
+		url, _ := media["contentId"].(string)
+		requestID, _ := payload["requestId"].(float64)
+		if c.expectedURL == "" || c.takenOver {
+			c.sessMu.Unlock()
+			continue
 		}
-		c.playerState, c.idleReason = state, idle
+		foreign := (c.mediaSessionID != 0 && id != 0 && c.mediaSessionID != int(id)) || (url != "" && url != c.expectedURL)
+		if foreign {
+			if (c.ownsMedia && !c.loading) || (requestID > 0 && int(requestID) != c.loadRequestID) {
+				c.takenOver = true
+				c.ownsMedia = false
+			}
+			c.sessMu.Unlock()
+			continue
+		}
+		if c.mediaSessionID == 0 && id > 0 {
+			if url != c.expectedURL && int(requestID) != c.loadRequestID {
+				c.sessMu.Unlock()
+				continue
+			}
+			c.mediaSessionID = int(id)
+			c.ownsMedia = true
+		}
+		if state == "IDLE" && idle == "INTERRUPTED" && !c.loading {
+			c.takenOver = true
+			c.ownsMedia = false
+			c.sessMu.Unlock()
+			continue
+		}
+		if state == "PLAYING" || state == "PAUSED" || state == "BUFFERING" || idle != "" {
+			c.loading = false
+		}
+		if extended, ok := s0["extendedStatus"].(map[string]any); ok && extended["playerState"] == "LOADING" {
+			state = "LOADING"
+		}
+		if commands, ok := s0["supportedMediaCommands"].(float64); ok {
+			bits := uint64(commands)
+			c.supportedCommands = &bits
+		}
+		if state != "" {
+			c.playerState = state
+		}
+		c.idleReason = idle
+		if _, ok := s0["currentTime"]; ok {
+			c.currentTime = cur
+			c.positionUpdated = time.Now()
+		}
+		if rate, ok := s0["playbackRate"].(float64); ok {
+			c.playbackRate = rate
+		}
+		if ids, ok := s0["activeTrackIds"].([]any); ok {
+			c.activeTrackIDs = []int{}
+			for _, raw := range ids {
+				if id, ok := raw.(float64); ok {
+					c.activeTrackIDs = append(c.activeTrackIDs, int(id))
+				}
+			}
+		}
+		if style, ok := s0["textTrackStyle"].(map[string]any); ok {
+			c.textTrackStyle = style
+		}
+		if media, ok := s0["media"].(map[string]any); ok {
+			if style, ok := media["textTrackStyle"].(map[string]any); ok {
+				c.textTrackStyle = style
+			}
+			if duration, ok := media["duration"].(float64); ok {
+				c.duration = duration
+			}
+			if ts, ok := media["tracks"].([]any); ok {
+				c.tracks = nil
+				for _, t := range ts {
+					if track, ok := t.(map[string]any); ok {
+						c.tracks = append(c.tracks, track)
+					}
+				}
+			}
+		}
 		session := c.mediaSessionID
 		c.sessMu.Unlock()
 
@@ -321,9 +483,37 @@ func (c *castConn) logReceiverStatus(seq uint64, payload map[string]any) {
 		logWarn("recv #%d: RECEIVER_STATUS without a status object", seq)
 		return
 	}
-	apps, _ := status["applications"].([]any)
+	if v, ok := status["volume"].(map[string]any); ok {
+		c.sessMu.Lock()
+		if level, ok := v["level"].(float64); ok {
+			c.volume = level
+		}
+		if muted, ok := v["muted"].(bool); ok {
+			c.muted = muted
+		}
+		c.sessMu.Unlock()
+	}
+	apps, hasApps := status["applications"].([]any)
+	c.sessMu.Lock()
+	if hasApps && c.ownsMedia && !c.loading {
+		match := false
+		for _, raw := range apps {
+			app, _ := raw.(map[string]any)
+			if app["transportId"] == c.transportID && app["sessionId"] == c.receiverSession {
+				match = true
+			}
+		}
+		if !match {
+			if hasPlaybackApplication(apps) {
+				c.takenOver = true
+			} else {
+				c.sessionEnded = true
+			}
+			c.ownsMedia = false
+		}
+	}
+	c.sessMu.Unlock()
 	if len(apps) == 0 {
-		logWarn("recv #%d: RECEIVER_STATUS lists no running applications — the receiver app is not (or no longer) running", seq)
 		return
 	}
 	for _, a := range apps {
@@ -336,6 +526,16 @@ func (c *castConn) logReceiverStatus(seq uint64, payload map[string]any) {
 	}
 }
 
+func hasPlaybackApplication(apps []any) bool {
+	for _, raw := range apps {
+		app, _ := raw.(map[string]any)
+		if id, _ := app["appId"].(string); id != "" && id != backdropReceiverAppID {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *castConn) heartbeatLoop() {
 	logDebug("heartbeat: loop started (PING every 5s)")
 	ticker := time.NewTicker(5 * time.Second)
@@ -346,9 +546,13 @@ func (c *castConn) heartbeatLoop() {
 			logDebug("heartbeat: loop stopped (connection closed)")
 			return
 		case <-ticker.C:
+			if !c.liveness(time.Now()) {
+				return
+			}
 			logTrace("heartbeat: sending PING")
 			if err := c.sendJSON(nsHeartbeat, platformReceiverID, map[string]any{"type": "PING"}); err != nil {
 				logError("heartbeat: PING failed, stopping loop: %v", err)
+				c.Close()
 				return
 			}
 		}
@@ -367,105 +571,77 @@ func (c *castConn) Close() {
 
 // launchAndLoad launches the Default Media Receiver, opens a connection to the
 // resulting session, and issues LOAD for the given media URL.
-func (c *castConn) launchAndLoad(mediaURL, contentType, title string) error {
-	logInfo("launchAndLoad: url=%s contentType=%s title=%q", mediaURL, contentType, title)
-
+func (c *castConn) launchAndLoad(load map[string]any) error {
 	transportID, err := c.launchReceiver()
 	if err != nil {
-		logError("launchAndLoad: launching receiver failed: %v", err)
 		return err
 	}
-	logInfo("launchAndLoad: receiver ready, transportId=%s", transportID)
 	c.sessMu.Lock()
 	c.transportID = transportID
+	media, _ := load["media"].(map[string]any)
+	c.expectedURL, _ = media["contentId"].(string)
+	c.mediaSessionID = 0
+	c.ownsMedia = false
+	c.loading = true
+	c.loadStarted = time.Now()
+	c.playerState = "LOADING"
+	c.idleReason = ""
+	c.takenOver = false
+	c.playbackRate = 1
+	c.supportedCommands = nil
+	c.sessionEnded = false
 	c.sessMu.Unlock()
-
-	// Virtual connection to the media session, then LOAD.
-	logDebug("launchAndLoad: opening virtual connection to %s", transportID)
-	if err := c.sendJSON(nsConnection, transportID, map[string]any{"type": "CONNECT"}); err != nil {
-		logError("launchAndLoad: CONNECT to %s failed: %v", transportID, err)
+	if err = c.sendJSON(nsConnection, transportID, map[string]any{"type": "CONNECT"}); err != nil {
 		return err
 	}
-
-	load := map[string]any{
-		"type":        "LOAD",
-		"autoplay":    true,
-		"currentTime": 0,
-		"media": map[string]any{
-			"contentId":   mediaURL,
-			"streamType":  "BUFFERED",
-			"contentType": contentType,
-			"metadata": map[string]any{
-				"type":  0, // GENERIC
-				"title": title,
-			},
-		},
-	}
-	logInfo("launchAndLoad: sending LOAD to %s", transportID)
-	reply, err := c.request(nsMedia, transportID, load)
-	if err != nil {
-		logError("launchAndLoad: LOAD got no usable reply: %v", err)
-		return err
-	}
-	if t, _ := reply["type"].(string); t == "LOAD_FAILED" || t == "LOAD_CANCELLED" {
-		logError("launchAndLoad: device rejected the media: type=%s detail=%v", t, reply)
-		return fmt.Errorf("device rejected media: %s", t)
-	}
-
-	if arr, ok := reply["status"].([]any); ok && len(arr) > 0 {
-		if s0, ok := arr[0].(map[string]any); ok {
-			if id, ok := s0["mediaSessionId"].(float64); ok {
-				c.sessMu.Lock()
-				c.mediaSessionID = int(id)
-				c.sessMu.Unlock()
-				logInfo("launchAndLoad: media session established, mediaSessionId=%d", int(id))
-			} else {
-				logWarn("launchAndLoad: LOAD reply status has no mediaSessionId — play/pause/seek will not work")
-			}
-		}
-	} else {
-		logWarn("launchAndLoad: LOAD reply had no status array (type=%v); the media session id is unknown", reply["type"])
-	}
-	return nil
+	_, err = c.requestTimeout(nsMedia, transportID, load, 30*time.Second)
+	return err
 }
 
 // launchReceiver LAUNCHes the default receiver and returns its transportId,
 // polling GET_STATUS briefly if the app isn't listed in the launch reply yet.
 func (c *castConn) launchReceiver() (string, error) {
-	logInfo("launchReceiver: LAUNCH appId=%s", defaultReceiverAppID)
-	reply, err := c.request(nsReceiver, platformReceiverID, map[string]any{
-		"type":  "LAUNCH",
-		"appId": defaultReceiverAppID,
-	})
-	if err != nil {
-		logError("launchReceiver: LAUNCH failed: %v", err)
-		return "", err
-	}
-	if t, _ := reply["type"].(string); t == "LAUNCH_ERROR" {
-		logError("launchReceiver: device returned LAUNCH_ERROR: %v", reply)
-		return "", fmt.Errorf("device refused to launch %s: %v", defaultReceiverAppID, reply["reason"])
-	}
-	if tid := transportIDFrom(reply); tid != "" {
-		logDebug("launchReceiver: transportId %s came straight from the LAUNCH reply", tid)
-		return tid, nil
-	}
-
-	logDebug("launchReceiver: LAUNCH reply had no transportId, polling GET_STATUS")
-	for i := 0; i < 5; i++ {
-		time.Sleep(500 * time.Millisecond)
-		st, err := c.request(nsReceiver, platformReceiverID, map[string]any{"type": "GET_STATUS"})
-		if err != nil {
-			logError("launchReceiver: GET_STATUS poll %d/5 failed: %v", i+1, err)
-			return "", err
-		}
-		if tid := transportIDFrom(st); tid != "" {
-			logDebug("launchReceiver: transportId %s appeared on poll %d/5", tid, i+1)
+	st, err := c.requestTimeout(nsReceiver, platformReceiverID, map[string]any{"type": "GET_STATUS"}, 4*time.Second)
+	if err == nil {
+		if tid := c.receiverTransport(st); tid != "" {
 			return tid, nil
 		}
-		logDebug("launchReceiver: poll %d/5 — receiver app still not listed", i+1)
 	}
-	logError("launchReceiver: gave up after 5 polls; the receiver app never appeared in the device status")
-	return "", errors.New("receiver launched but no transportId appeared")
+	st, err = c.requestTimeout(nsReceiver, platformReceiverID, map[string]any{"type": "LAUNCH", "appId": defaultReceiverAppID}, 12*time.Second)
+	if err != nil {
+		return "", err
+	}
+	if tid := c.receiverTransport(st); tid != "" {
+		return tid, nil
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		st, err = c.requestTimeout(nsReceiver, platformReceiverID, map[string]any{"type": "GET_STATUS"}, 4*time.Second)
+		if err != nil {
+			return "", err
+		}
+		if tid := c.receiverTransport(st); tid != "" {
+			return tid, nil
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return "", errors.New("TV did not start its media receiver")
+}
+func (c *castConn) receiverTransport(reply map[string]any) string {
+	status, _ := reply["status"].(map[string]any)
+	apps, _ := status["applications"].([]any)
+	for _, raw := range apps {
+		app, _ := raw.(map[string]any)
+		if app["appId"] == defaultReceiverAppID {
+			tid, _ := app["transportId"].(string)
+			sid, _ := app["sessionId"].(string)
+			c.sessMu.Lock()
+			c.receiverSession = sid
+			c.sessMu.Unlock()
+			return tid
+		}
+	}
+	return ""
 }
 
 func transportIDFrom(reply map[string]any) string {
@@ -496,6 +672,13 @@ func transportIDFrom(reply map[string]any) string {
 // mediaCommand issues a simple media command (PLAY/PAUSE/STOP/SEEK) against the
 // current media session.
 func (c *castConn) mediaCommand(cmd string, extra map[string]any) error {
+	if err := c.ownershipError(); err != nil {
+		return err
+	}
+	bit := map[string]uint64{"PAUSE": 1, "SEEK": 2, "EDIT_TRACKS_INFO": 1 << 12}[cmd]
+	if bit != 0 && !c.supports(bit) {
+		return fmt.Errorf("the TV does not support %s for this media", cmd)
+	}
 	c.sessMu.Lock()
 	dest, session := c.transportID, c.mediaSessionID
 	c.sessMu.Unlock()
@@ -519,19 +702,14 @@ func (c *castConn) mediaCommand(cmd string, extra map[string]any) error {
 
 func (c *castConn) play() error  { return c.mediaCommand("PLAY", nil) }
 func (c *castConn) pause() error { return c.mediaCommand("PAUSE", nil) }
-func (c *castConn) stop() error  { return c.mediaCommand("STOP", nil) }
+func (c *castConn) stop() error {
+	if err := c.queryStatus(); err != nil {
+		return err
+	}
+	return c.mediaCommand("STOP", nil)
+}
 func (c *castConn) seek(sec float64) error {
 	return c.mediaCommand("SEEK", map[string]any{"currentTime": sec})
-}
-
-// stopReceiver tears down the whole session (used on quit).
-func (c *castConn) stopReceiver() {
-	logInfo("stopReceiver: sending STOP to %s", platformReceiverID)
-	if _, err := c.request(nsReceiver, platformReceiverID, map[string]any{"type": "STOP"}); err != nil {
-		logWarn("stopReceiver: STOP was not acknowledged: %v", err)
-		return
-	}
-	logInfo("stopReceiver: receiver stopped")
 }
 
 // shortNS trims the long urn:x-cast:com.google.cast. prefix for readable logs.

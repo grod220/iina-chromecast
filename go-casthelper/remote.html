@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Chromecast Remote</title><link rel="stylesheet" href="remote.css"></head>
+<body>
+<header><h1>Chromecast Remote</h1><span id="phase" class="status" role="status">Ready</span></header>
+<section class="card" aria-label="TV connection">
+ <label class="eyebrow" for="tv">TV</label>
+ <div class="device-row"><select id="tv" aria-label="TV"><option value="">Looking for TVs…</option></select><button id="refresh">Refresh</button></div>
+ <p id="device-hint" class="hint"></p>
+ <button id="cast" class="primary">Cast Video</button><button id="reconnect" class="primary" hidden>Reconnect</button><button id="stop" hidden>Stop Casting</button>
+</section>
+<section class="card" aria-label="Playback">
+ <span class="eyebrow" id="playing-label">VIDEO IN IINA</span><h2 class="movie" id="title">Open a video in IINA to get started.</h2>
+ <div id="playback">
+  <input id="seek" type="range" min="0" max="1" step="0.1" value="0" aria-label="Playback position">
+  <div class="times"><span id="elapsed">0:00</span><span id="duration">0:00</span></div>
+  <div class="transport"><button id="back" aria-label="Skip back 10 seconds">−10s</button><button id="toggle" class="primary">Play</button><button id="forward" aria-label="Skip forward 10 seconds">+10s</button></div>
+  <div class="volume"><button id="mute" aria-label="Mute TV">Mute</button><input id="volume" type="range" min="0" max="100" step="1" value="0" aria-label="TV volume"></div>
+ </div>
+</section>
+<section class="card" aria-label="Subtitles">
+ <label class="eyebrow" for="subtitles">SUBTITLES</label>
+ <div class="track-row"><select id="subtitles" aria-label="Subtitle track"><option value="off">Off</option></select><button id="use-track" class="primary" hidden>Use Track</button></div>
+ <div id="active-track" class="active-track"></div>
+ <div class="preview-head"><span>Text preview</span><button id="refresh-preview" class="quiet">Refresh sample</button></div>
+ <div id="samples" class="samples" aria-live="polite"><p class="preview-placeholder">Preview a track, then choose Use Track.</p></div>
+ <details><summary>Appearance</summary>
+  <div class="appearance-row"><label for="size">Text size</label><select id="size"><option value="0.75">75%</option><option value="0.9">90%</option><option value="1">100% · Standard</option><option value="1.1">110%</option><option value="1.25">125%</option><option value="1.5">150%</option><option value="2">200%</option></select></div>
+  <div class="appearance-row"><label for="background">Background</label><select id="background"><option value="#00000099">Balanced · 60%</option><option value="#00000000">Transparent</option><option value="#00000080">Dim · 50%</option><option value="#000000C0">Dark · 75%</option></select></div>
+ </details>
+</section>
+<progress id="progress" max="1" value="0" hidden aria-label="Preparing video"></progress>
+<p id="message" class="message" role="alert" hidden></p>
+<footer class="footer"><span id="format"></span></footer>
+<script src="remote-ui.js"></script>
+</body></html>

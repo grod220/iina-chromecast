@@ -1,0 +1,10 @@
+import {cp,mkdir,rm} from 'node:fs/promises';
+import {fileURLToPath} from 'node:url';
+import path from 'node:path';
+const root=fileURLToPath(new URL('..',import.meta.url));
+const target=path.join(root,'build','iina-chromecast.iinaplugin');
+await rm(target,{recursive:true,force:true});
+await mkdir(target,{recursive:true});
+await cp(path.join(root,'Info.json'),path.join(target,'Info.json'));
+await cp(path.join(root,'dist'),path.join(target,'dist'),{recursive:true});
+console.log('Packaged build/iina-chromecast.iinaplugin');

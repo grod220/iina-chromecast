@@ -1,0 +1,10 @@
+import {build} from 'esbuild';
+import {mkdir,copyFile} from 'node:fs/promises';
+await mkdir('dist',{recursive:true});
+await build({entryPoints:['src/index.js','src/global.js'],bundle:true,outdir:'dist',format:'iife',target:'safari16',minify:false});
+await build({entryPoints:['src/remote-ui.js'],bundle:true,outdir:'dist',format:'iife',target:'safari16',minify:false});
+await copyFile('ui/remote.html','go-casthelper/remote.html');
+await copyFile('ui/remote.html','dist/remote.html');
+await copyFile('ui/remote.css','dist/remote.css');
+await copyFile('ui/remote.css','go-casthelper/remote.css');
+await copyFile('dist/remote-ui.js','go-casthelper/remote-ui.js');

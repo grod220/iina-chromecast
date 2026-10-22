@@ -1,0 +1,31 @@
+name: test
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+      - name: Install FFmpeg
+        run: brew list ffmpeg || brew install ffmpeg
+      - run: npm ci
+      - run: npm test
+      - run: npm run build:helper
+      - run: npm run package
+      - name: Check committed bundles
+        run: git diff --exit-code -- dist go-casthelper/remote-ui.js go-casthelper/remote.html go-casthelper/remote.css

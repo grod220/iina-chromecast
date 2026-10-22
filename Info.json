@@ -1,8 +1,8 @@
 {
   "name": "IINA Chromecast",
   "identifier": "com.dpacmittal.iina-chromecast",
-  "version": "0.1.0",
-  "description": "Chromecast support for IINA",
+  "version": "0.4.3",
+  "description": "Chromecast remote controls, live subtitles, reconnection, and automatic format compatibility",
   "author": {
     "name": "Deepak Mittal",
     "email": "deepak@dpacmittal.com",
@@ -17,7 +17,7 @@
     "network-request",
     "file-system"
   ],
-  "allowedDomains": ["*"],
-  "ghRepo": "dpacmittal/iina-chromecast",
-  "ghVersion": "0.1.0"
+  "allowedDomains": [
+    "*"
+  ]
 }

@@ -1,2 +1,28 @@
-!function(){var t=iina.utils,a=iina.http,e=iina.global,n=iina.console,o=`${t.resolvePath("@data/casthelper")}`;n.log("Casthelper path:",o);var s="http://127.0.0.1:9092";e.onMessage("cast:load",function(t){n.log("Casting from global",t),a.post(`${s}/cast`,{data:t,headers:{"Content-Type":"application/json"}})}),e.onMessage("cast:pause",function(){return a.post(`${s}/pause`,{})}),e.onMessage("cast:play",function(){return a.post(`${s}/play`,{})}),e.onMessage("cast:seek",function(t){return a.post(`${s}/seek`,{data:t,headers:{"Content-Type":"application/json"}})}),e.onMessage("cast:stop",function(){return a.post(`${s}/stop`,{})}),n.log("Starting casthelper"),t.exec(o,["-control","127.0.0.1:9092","-media","0.0.0.0:8010"],void 0,function(t){t.includes("READY")&&console.log("helper up")})}();
-//# sourceMappingURL=global.js.map
+(() => {
+  // src/global.js
+  var { utils, http, console: log } = iina;
+  var starting = false;
+  async function ensureHelper() {
+    if (starting) return;
+    starting = true;
+    let healthy = false;
+    try {
+      try {
+        const r = await http.get("http://127.0.0.1:9092/status");
+        if (r.statusCode === 200) {
+          healthy = true;
+          return;
+        }
+      } catch {
+      }
+      const bin = utils.resolvePath("@data/casthelper");
+      await utils.exec("/bin/sh", ["-c", '"$1" -parent "$PPID" -control 127.0.0.1:9092 -media 0.0.0.0:8010 </dev/null >/dev/null 2>&1 &', "casthelper", bin]);
+    } catch (error) {
+      log.log("Chromecast helper: " + error);
+    } finally {
+      starting = false;
+      setTimeout(ensureHelper, healthy ? 15e3 : 1e3);
+    }
+  }
+  ensureHelper();
+})();

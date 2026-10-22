@@ -1,32 +1,32 @@
 name: release-casthelper
-
 on:
   push:
-    tags: ["v*"]
-
+    tags: ['v*']
 permissions:
-  contents: write # required to create/update the release
-
+  contents: write
 jobs:
   build:
-    runs-on: macos-latest # need macOS for lipo + codesign
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
-
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
       - uses: actions/setup-go@v7
         with:
-          go-version: "1.23"
-
-      - name: Build + ad-hoc sign universal binary
-        working-directory: go-casthelper # adjust to where go.mod lives
-        run: |
-          GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o casthelper-arm64 .
-          GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o casthelper-amd64 .
-          lipo -create -output casthelper casthelper-arm64 casthelper-amd64
-          codesign -s - --force casthelper      # ad-hoc; free, no Apple account
-          codesign -dv casthelper || true
-
-      - name: Publish to release
-        uses: softprops/action-gh-release@v3
+          go-version: stable
+          cache: false
+      - name: Install FFmpeg
+        run: brew list ffmpeg || brew install ffmpeg
+      - run: npm ci
+      - run: npm test
+      - run: sh scripts/build-helper.sh --universal
+      - run: npm run package
+      - name: Archive plugin bundle
+        run: ditto -c -k --keepParent build/iina-chromecast.iinaplugin build/iina-chromecast.iinaplugin.zip
+      - uses: softprops/action-gh-release@v3
         with:
-          files: go-casthelper/casthelper
+          files: |
+            build/casthelper
+            build/iina-chromecast.iinaplugin.zip

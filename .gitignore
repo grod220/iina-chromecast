@@ -123,5 +123,17 @@ out
 .vscode/
 *.js.map
 *.css.map
-package-lock.json
-dist
+
+# Local builds and private runtime/audit data
+build/
+casthelper
+casthelper-arm64
+casthelper-amd64
+audit/
+LOCAL-CHANGES.md
+LIFECYCLE-AUDIT.md
+*.sock
+*.plist
+*.mkv
+*.mp4
+*.webm
